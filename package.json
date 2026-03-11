@@ -1,0 +1,25 @@
+{
+  "name": "@kne/prompts-fastify-libs",
+  "version": "1.0.0",
+  "description": "Fastify 业务插件开发辅助提示词集合，包含用户认证、消息发送、数据库操作、多租户管理、插件开发指南等常用任务的 AI 提示词模板",
+  "files": [
+    "prompts"
+  ],
+  "scripts": {
+    "init": "husky",
+    "prettier": "prettier --config .prettierrc --write '{libs/**/*,index}.{js,jsx,ts,tsx,json,css,scss}'",
+    "lint-staged": "npx lint-staged"
+  },
+  "keywords": [
+    "prompts",
+    "nodejs",
+    "fastify"
+  ],
+  "author": "linzp",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kne-union/prompts-fastify-libs.git"
+  },
+  "homepage": "https://github.com/kne-union/prompts-fastify-libs"
+}
