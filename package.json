@@ -13,7 +13,8 @@
   "keywords": [
     "prompts",
     "nodejs",
-    "fastify"
+    "fastify",
+    "fastify-plugins"
   ],
   "author": "linzp",
   "license": "MIT",
