@@ -75,15 +75,15 @@ module.exports = fp(async (fastify, options) => {
   options = Object.assign({}, {
     // 数据库配置
     dbTableNamePrefix: 't_',
-    
+
     // 插件命名
     name: 'defaultName',
     prefix: '/api/default',
-    
+
     // 业务配置
     maxItems: 100,
     timeout: 30000,
-    
+
     // 扩展点
     getUserModel: () => {
       if (!fastify.account) {
@@ -91,7 +91,7 @@ module.exports = fp(async (fastify, options) => {
       }
       return fastify.account.models.user;
     },
-    
+
     // 外部配置文件
     configPath: path.resolve(process.cwd(), './config.js')
   }, options);
@@ -113,7 +113,7 @@ const merge = require('lodash/merge');
 
 const loadExternalConfig = async (filePath) => {
   const ext = path.extname(filePath);
-  
+
   if (ext === '.js') {
     return require(filePath);
   }
@@ -123,7 +123,7 @@ const loadExternalConfig = async (filePath) => {
   if (ext === '.yml') {
     return yml.load(await fs.readFile(filePath, 'utf8'));
   }
-  
+
   return {};
 };
 
@@ -144,18 +144,18 @@ fastify.register(namespace, {
       // 自定义用户认证
       customUser: async (request) => {
         const { services } = fastify[options.name];
-        
+
         // 获取用户详细信息
         request.userDetail = await services.user.getDetail(
           request.userInfo.id
         );
-        
+
         // 验证用户状态
         if (request.userDetail.status !== 'active') {
           throw new Forbidden('用户账号已被禁用');
         }
       },
-      
+
       // 管理员认证
       admin: async (request) => {
         if (!request.userInfo.isAdmin) {
@@ -212,39 +212,88 @@ const authenticate = async (request) => {
 
 ```javascript
 const fp = require('fastify-plugin');
+const omit = require('lodash/omit');
 
 module.exports = fp(async (fastify, options) => {
-  const { models, services } = fastify[options.name];
-  
-  // 定义服务方法
-  const create = async (data) => {
-    // 业务逻辑
-    return await models.resource.create(data);
+  const { models } = fastify[options.name];
+  const { Op } = fastify.sequelize.Sequelize;
+
+  // 创建 - 第一个参数为 authenticatePayload,自动注入 tenantId
+  const create = async (authenticatePayload, data) => {
+    const { tenantId } = authenticatePayload;
+    return await models.resource.create(Object.assign({}, data, { tenantId }));
   };
-  
-  const list = async ({ filter, perPage, currentPage }) => {
-    // 分页查询逻辑
-    const { count, rows } = await models.resource.findAndCountAll({
-      where: filter,
+
+  // 详情 - 校验 tenantId 确保数据隔离
+  const detail = async (authenticatePayload, { id }) => {
+    const { tenantId } = authenticatePayload;
+    const record = await models.resource.findByPk(id);
+    if (!record || record.tenantId !== tenantId) {
+      throw fastify.httpErrors.notFound(fastify.intl('resourceNotFound'));
+    }
+    return record;
+  };
+
+  // 修改 - 使用 save 命名,用 omit 过滤不可修改字段
+  const save = async (authenticatePayload, { id, ...data }) => {
+    const record = await detail(authenticatePayload, { id });
+    await record.update(omit(data, ['tenantId', 'createdAt', 'updatedAt']));
+    return record;
+  };
+
+  // 删除 - 无返回值
+  const remove = async (authenticatePayload, { id }) => {
+    const record = await detail(authenticatePayload, { id });
+    await record.destroy();
+  };
+
+  // 列表 - filter 对象包裹筛选条件,使用 perPage 分页
+  const list = async (authenticatePayload, { filter = {}, perPage = 20, currentPage = 1 }) => {
+    const { tenantId } = authenticatePayload;
+    const where = { tenantId };
+
+    // 从 filter 中提取筛选条件
+    if (filter.status) {
+      where.status = filter.status;
+    }
+    if (filter.keyword) {
+      where[Op.or] = [
+        { name: { [Op.iLike]: `%${filter.keyword}%` } }
+      ];
+    }
+
+    const { rows, count } = await models.resource.findAndCountAll({
+      where,
+      offset: perPage * (currentPage - 1),
       limit: perPage,
-      offset: (currentPage - 1) * perPage
+      order: [['createdAt', 'DESC']]
     });
-    
-    return { pageData: rows, totalCount: count };
+
+    return {
+      pageData: rows,
+      totalCount: count
+    };
   };
-  
+
   // 挂载到 fastify 命名空间
   Object.assign(fastify[options.name].services, {
     resource: {
       create,
-      list,
       detail,
-      update,
-      remove
+      save,
+      remove,
+      list
     }
   });
 });
 ```
+
+**Service 方法签名规范**:
+- 第一个参数始终为 `authenticatePayload`(包含 `tenantId` 等认证信息)
+- 第二个参数为业务数据(来自 `request.query` 或 `request.body`)
+- 修改方法使用 `save` 命名(而非 `update`),body 中 `id` 与其他字段同级,service 内用 `{ id, ...data }` 解构
+- 使用 `lodash/omit` 过滤 `tenantId`、`createdAt`、`updatedAt` 等不可修改字段
+- `detail` 方法内校验 `record.tenantId === tenantId`,其他方法(如 `save`、`remove`)复用 `detail` 做鉴权
 
 ### 2. 业务逻辑封装
 
@@ -309,68 +358,262 @@ const detail = async ({ id }) => {
 
 ## Controller 层设计
 
-### 1. 路由标准化
+### 1. 路由规则规范
 
-统一路由定义格式:
+#### HTTP 方法约定
+
+| 操作 | HTTP 方法 | 参数来源 | 说明 |
+|------|-----------|----------|------|
+| 列表查询 | `GET` | `request.query` | 读操作,参数通过 query string 传递 |
+| 详情查询 | `GET` | `request.query` | 读操作,参数通过 query string 传递 |
+| 创建资源 | `POST` | `request.body` | 写操作,参数通过 request body 传递 |
+| 修改资源 | `POST` | `request.body` | 写操作,使用 `save` 而非 `update` |
+| 删除资源 | `POST` | `request.body` | 写操作,参数通过 request body 传递 |
+
+**核心原则**: 读操作用 `GET`,写操作用 `POST`。
+
+#### URL 命名约定
+
+所有路由统一使用以下 5 个路径,以 `${options.prefix}/资源名/操作` 格式:
+
+```
+GET  ${options.prefix}/resource/list    - 列表查询
+GET  ${options.prefix}/resource/detail  - 详情查询
+POST ${options.prefix}/resource/create  - 创建资源
+POST ${options.prefix}/resource/save    - 修改资源(注意:使用 save 而非 update)
+POST ${options.prefix}/resource/remove  - 删除资源
+```
+
+#### 列表查询参数约定
+
+列表接口统一使用 `GET` + `query`,参数结构如下:
+
+```javascript
+query: {
+  type: 'object',
+  properties: {
+    filter: {
+      type: 'object',
+      default: {}
+    },
+    perPage: {
+      type: 'number',
+      default: 20
+    },
+    currentPage: {
+      type: 'number',
+      default: 1
+    }
+  }
+}
+```
+
+- **filter**: 筛选条件对象,所有业务筛选字段放在 filter 内(如 `filter.type`、`filter.status`、`filter.keyword`)
+- **perPage**: 每页条数,默认 20(注意:使用 `perPage` 而非 `pageSize`)
+- **currentPage**: 当前页码,默认 1
+
+#### 详情查询参数约定
+
+```javascript
+query: {
+  type: 'object',
+  required: ['id'],
+  properties: {
+    id: { type: 'string' }
+  }
+}
+```
+
+#### Service 调用约定
+
+所有 Service 方法**第一个参数为 `authenticatePayload`**(即 `request.tenantUserInfo`),第二个参数为业务数据:
+
+```javascript
+// GET 请求
+async (request) => {
+  return services.resource.list(request.tenantUserInfo, request.query);
+}
+
+// POST 请求 - 创建
+async (request) => {
+  return services.resource.create(request.tenantUserInfo, request.body);
+}
+
+// POST 请求 - 修改(save)
+async (request) => {
+  await services.resource.save(request.tenantUserInfo, request.body);
+  return {};
+}
+
+// POST 请求 - 删除
+async (request) => {
+  await services.resource.remove(request.tenantUserInfo, request.body);
+  return {};
+}
+```
+
+**返回值约定**:
+- `create`: 返回创建的记录
+- `save` / `remove`: 返回 `{}`(空对象)
+- `list` / `detail`: 返回查询结果
+
+#### 认证中间件约定
+
+租户业务路由统一使用 `authenticate.user` + `tenantAuthenticate.tenantUser`:
+
+```javascript
+const { authenticate } = fastify.account;
+const { authenticate: tenantAuthenticate } = fastify.tenant;
+
+// 路由认证
+{
+  onRequest: [authenticate.user, tenantAuthenticate.tenantUser]
+}
+```
+
+#### 完整路由示例
 
 ```javascript
 const fp = require('fastify-plugin');
 
 module.exports = fp(async (fastify, options) => {
-  const { services, authenticate } = fastify[options.name];
-  const userAuthenticate = options.getUserAuthenticate();
-  
-  // GET 请求
-  fastify.get(`${options.prefix}/list`, {
-    onRequest: [userAuthenticate, authenticate.customUser],
-    schema: {
-      summary: '列表查询',
-      query: {
-        type: 'object',
-        properties: {
-          filter: { type: 'object' },
-          perPage: { type: 'number', default: 20 },
-          currentPage: { type: 'number', default: 1 }
+  const { services } = fastify[options.name];
+  const { authenticate } = fastify.account;
+  const { authenticate: tenantAuthenticate } = fastify.tenant;
+
+  // 列表查询
+  fastify.get(
+    `${options.prefix}/resource/list`,
+    {
+      onRequest: [authenticate.user, tenantAuthenticate.tenantUser],
+      schema: {
+        summary: '资源列表',
+        query: {
+          type: 'object',
+          properties: {
+            filter: { type: 'object', default: {} },
+            perPage: { type: 'number', default: 20 },
+            currentPage: { type: 'number', default: 1 }
+          }
         }
       }
+    },
+    async (request) => {
+      return services.resource.list(request.tenantUserInfo, request.query);
     }
-  }, async (request) => {
-    return await services.resource.list(request.query);
-  });
-  
-  // POST 请求
-  fastify.post(`${options.prefix}/create`, {
-    onRequest: [userAuthenticate, authenticate.customUser],
-    schema: {
-      summary: '创建资源',
-      body: {
-        type: 'object',
-        properties: {
-          name: { type: 'string' },
-          description: { type: 'string' }
-        },
-        required: ['name']
+  );
+
+  // 详情查询
+  fastify.get(
+    `${options.prefix}/resource/detail`,
+    {
+      onRequest: [authenticate.user, tenantAuthenticate.tenantUser],
+      schema: {
+        summary: '资源详情',
+        query: {
+          type: 'object',
+          required: ['id'],
+          properties: {
+            id: { type: 'string' }
+          }
+        }
       }
+    },
+    async (request) => {
+      return services.resource.detail(request.tenantUserInfo, request.query);
     }
-  }, async (request) => {
-    await services.resource.create(request.body);
-    return {};
-  });
+  );
+
+  // 创建资源
+  fastify.post(
+    `${options.prefix}/resource/create`,
+    {
+      onRequest: [authenticate.user, tenantAuthenticate.tenantUser],
+      schema: {
+        summary: '创建资源',
+        body: {
+          type: 'object',
+          properties: {
+            name: { type: 'string' },
+            description: { type: 'string' }
+          },
+          required: ['name']
+        }
+      }
+    },
+    async (request) => {
+      return services.resource.create(request.tenantUserInfo, request.body);
+    }
+  );
+
+  // 修改资源
+  fastify.post(
+    `${options.prefix}/resource/save`,
+    {
+      onRequest: [authenticate.user, tenantAuthenticate.tenantUser],
+      schema: {
+        summary: '修改资源',
+        body: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            name: { type: 'string' },
+            description: { type: 'string' }
+          },
+          required: ['id']
+        }
+      }
+    },
+    async (request) => {
+      await services.resource.save(request.tenantUserInfo, request.body);
+      return {};
+    }
+  );
+
+  // 删除资源
+  fastify.post(
+    `${options.prefix}/resource/remove`,
+    {
+      onRequest: [authenticate.user, tenantAuthenticate.tenantUser],
+      schema: {
+        summary: '删除资源',
+        body: {
+          type: 'object',
+          required: ['id'],
+          properties: {
+            id: { type: 'string' }
+          }
+        }
+      }
+    },
+    async (request) => {
+      await services.resource.remove(request.tenantUserInfo, request.body);
+      return {};
+    }
+  );
 });
 ```
 
 ### 2. 参数注入模式
 
-统一注入上下文信息:
+Service 方法第一个参数统一为 `authenticatePayload`(租户用户信息),由 Controller 层注入:
 
 ```javascript
+// Controller 层注入 request.tenantUserInfo
 async (request) => {
-  return await services.resource.list(
-    Object.assign({}, request.query, {
-      userId: request.userInfo.id
-    })
-  );
+  return services.resource.list(request.tenantUserInfo, request.query);
 }
+```
+
+Service 层从 `authenticatePayload` 获取租户 ID,确保数据隔离:
+
+```javascript
+const list = async (authenticatePayload, { filter = {}, perPage = 20, currentPage = 1 }) => {
+  const { tenantId } = authenticatePayload;
+  // 使用 tenantId 过滤,确保租户数据隔离
+  const where = { tenantId, ...filter };
+  // ...
+};
 ```
 
 ### 3. Schema 复用
@@ -622,12 +865,12 @@ const createWithRelations = async (data) => {
 };
 ```
 
-### 4. 数据转换
+### 3. 数据转换
 
 在 Service 层进行数据转换,Controller 层保持简单:
 
 ```javascript
-const detail = async ({ id }) => {
+const detail = async (authenticatePayload, { id }) => {
   const resource = await models.resource.findByPk(id);
   
   // 数据转换
@@ -637,29 +880,33 @@ const detail = async ({ id }) => {
   
   // 关联数据
   resource.setDataValue('relations',
-    await services.relation.list({ resourceId: id })
+    await services.relation.list(authenticatePayload, { resourceId: id })
   );
   
   return resource;
 };
 ```
 
-### 5. 分页查询标准化
+### 4. 分页查询标准化
 
 ```javascript
-const list = async ({ filter, perPage = 20, currentPage = 1 }) => {
+const list = async (authenticatePayload, { filter = {}, perPage = 20, currentPage = 1 }) => {
+  const { tenantId } = authenticatePayload;
+  const where = { tenantId };
+
+  // 从 filter 中构建查询条件
+  // ...
+
   const { count, rows } = await models.resource.findAndCountAll({
-    where: filter,
+    where,
     limit: perPage,
-    offset: (currentPage - 1) * perPage,
+    offset: perPage * (currentPage - 1),
     order: [['createdAt', 'DESC']]
   });
-  
+
   return {
     pageData: rows,
-    totalCount: count,
-    perPage,
-    currentPage
+    totalCount: count
   };
 };
 ```
@@ -671,7 +918,7 @@ const list = async ({ filter, perPage = 20, currentPage = 1 }) => {
 ```javascript
 options: {
   paranoid: true,  // 启用软删除
-  timestamps: true
+    timestamps: true
 }
 
 // 删除操作
@@ -693,14 +940,14 @@ options = {
   // 钩子函数
   beforeCreate: async (data) => data,
   afterCreate: async (resource) => {},
-  
+
   // 自定义验证
   validateCreate: async (data) => {
     if (!data.custom) {
       throw new Error('自定义验证失败');
     }
   },
-  
+
   // 自定义处理器
   customProcessor: async (resource) => {
     // 自定义处理逻辑
