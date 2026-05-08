@@ -1028,14 +1028,401 @@ fastify.get('/test', async (request, reply) => {
 });
 ```
 
+## 按功能分类的权限验证（getAuthenticate）
+
+### 1. 设计思想
+
+HTTP 接口的 `onRequest` 不使用统一单一认证中间件，而是通过 `options.getAuthenticate(type)` 按功能分类返回不同的认证中间件数组。调用方能根据业务需求精确控制每个功能模块的权限等级。
+
+```javascript
+// 路由中使用
+fastify.get(`${options.prefix}/list`, {
+  onRequest: options.getAuthenticate('conversation'),
+  // ...
+});
+
+fastify.post(`${options.prefix}/members`, {
+  onRequest: options.getAuthenticate('conversation:manage'),
+  // ...
+});
+```
+
+### 2. 命名规范
+
+使用 `模块:操作` 格式命名 type，让调用方一眼可知含义：
+
+| 格式 | 示例 | 含义 |
+|------|------|------|
+| `模块` | `conversation`、`message` | 模块的默认/查看权限 |
+| `模块:create` | `conversation:create` | 创建操作 |
+| `模块:manage` | `conversation:manage` | 管理操作（通常需更高权限） |
+| `模块:leave` | `conversation:leave` | 退出操作（与 manage 分离，普通用户也能操作） |
+
+**命名原则**：
+- 使用业务语义而非机械的 `read`/`write`，调用方无需猜测哪个接口属于"读"哪个属于"写"
+- `:manage` 与 `:leave` 分离：管理操作需 admin 权限，退出只需 user 权限
+- 不同模块可定义不同操作类型，根据业务灵活扩展
+
+### 3. 默认实现
+
+在 `index.js` 中提供合理的默认实现，调用方可覆盖：
+
+```javascript
+options = Object.assign({}, {
+  getAuthenticate: (type) => {
+    const {authenticate} = fastify.account;
+    switch (type) {
+      case 'conversation:manage':
+        return [authenticate.user, authenticate.admin];
+      case 'conversation':
+      case 'conversation:create':
+      case 'conversation:leave':
+      case 'message':
+      case 'systemMessage':
+      default:
+        return [authenticate.user];
+    }
+  }
+}, options);
+```
+
+### 4. 调用方覆盖示例
+
+```javascript
+await fastify.register(require('@kne/fastify-im'), {
+  getAuthenticate: (type) => {
+    const {authenticate} = fastify.account;
+    switch (type) {
+      case 'conversation:create':
+        // 限制建群权限
+        return [authenticate.user, authenticate.admin];
+      case 'systemMessage':
+        // 系统消息只对特定角色可见
+        return [authenticate.user, customRoleAuthenticate('hr')];
+      default:
+        return [authenticate.user];
+    }
+  }
+});
+```
+
+## WebSocket 插件开发模式
+
+### 1. 依赖注册
+
+使用 `@fastify/websocket` 提供 WebSocket 支持，在 `peerDependencies` 中声明：
+
+```json
+{
+  "peerDependencies": {
+    "@fastify/websocket": ">=9"
+  }
+}
+```
+
+### 2. Token 认证连接
+
+通过 `sec-websocket-protocol` 头或 query 参数传递 Token，在连接建立时验证：
+
+```javascript
+fastify.get(`${options.prefix}/ws`, {websocket: true}, async (socket, request) => {
+  const token = request.headers['sec-websocket-protocol'] || request.query?.token;
+
+  if (!token) {
+    socket.close(4001, 'Authentication required');
+    return;
+  }
+
+  let clientInfo;
+  try {
+    clientInfo = await options.verifyToken(token);
+  } catch (e) {
+    socket.close(4002, 'Authentication failed');
+    return;
+  }
+
+  if (!clientInfo || !clientInfo.userId) {
+    socket.close(4003, 'Invalid token');
+    return;
+  }
+
+  // 连接成功，注册到连接池
+  // ...
+});
+```
+
+### 3. 连接池管理（ConnectionStore 抽象 + 多端支持）
+
+使用 `ConnectionStore` 接口抽象管理连接，默认 `MemoryConnectionStore` 使用两个 Map（`socketId → connection`、`userId → Set<socketId>`），支持注入 Redis 等外部存储以适配多实例部署：
+
+```javascript
+/**
+ * ConnectionStore 接口规范（所有方法均为 async）：
+ * - addConnection(socketId, connection) → {wasFirstConnection: boolean}
+ * - removeConnection(socketId) → {userId, isFullyOffline: boolean} | null
+ * - getConnection(socketId) → connection | null
+ * - getUserConnectionIds(userId) → string[]
+ * - isUserOnline(userId) → boolean
+ * - getOnlineUserIds() → string[]
+ * - getOnlineCount() → number
+ */
+
+// 默认内存实现
+class MemoryConnectionStore {
+  constructor() {
+    this._connections = new Map();  // socketId → connection
+    this._userSockets = new Map();  // userId → Set<socketId>
+  }
+  async addConnection(socketId, connection) { /* ... */ }
+  async removeConnection(socketId) { /* ... */ }
+  // ...其他方法
+}
+
+// 通过 options 注入，默认使用内存实现
+const store = options.connectionStore || new MemoryConnectionStore();
+
+Object.assign(fastify[options.name].services, {
+  ws: {
+    async create(socket, clientInfo) {
+      const socketId = `${clientInfo.userId}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      const connection = {socket, userId: clientInfo.userId, role: clientInfo.role, clientInfo};
+      const result = await store.addConnection(socketId, connection);
+      return {socketId, wasFirstConnection: result.wasFirstConnection};
+    },
+
+    async remove(socketId) {
+      const connection = await store.getConnection(socketId);
+      if (!connection) return null;
+      return store.removeConnection(socketId);
+    },
+
+    async sendToUser(userId, type, payload) {
+      const connectionIds = await store.getUserConnectionIds(userId);
+      if (!connectionIds || connectionIds.length === 0) return false;
+      const message = JSON.stringify({type, payload});
+      for (const socketId of connectionIds) {
+        const connection = await store.getConnection(socketId);
+        if (connection) {
+          try { connection.socket.send(message); } catch (e) {}
+        }
+      }
+      return true;
+    },
+
+    async isOnline(userId) { return store.isUserOnline(userId); }
+  }
+});
+```
+
+**关键返回值**：
+- `create()` 返回 `{socketId, wasFirstConnection}` — `wasFirstConnection` 标识是否为该用户的首个连接，用于触发上线广播
+- `remove()` 返回 `{userId, isFullyOffline}` 或 `null` — `isFullyOffline` 标识该用户是否全部端离线，用于触发离线广播
+- **所有 ws service 方法均为 `async`**，调用方必须 `await`
+
+### 4. 心跳保活机制
+
+每个连接内置 ping/pong 心跳检测，防止僵尸连接：
+
+```javascript
+const heartbeatInterval = options.heartbeatInterval || 30000;
+
+const connection = {
+  socket, userId: clientInfo.userId, role: clientInfo.role, clientInfo,
+  alive: true,
+  heartbeatTimer: setInterval(() => {
+    if (!connection.alive) {
+      clearInterval(connection.heartbeatTimer);
+      try { socket.close(4004, 'Heartbeat timeout'); } catch (e) {}
+      return;
+    }
+    connection.alive = false;
+    try { socket.ping(); } catch (e) {}
+  }, heartbeatInterval)
+};
+
+socket.on('pong', () => { connection.alive = true; });
+```
+
+**设计要点**：
+- 每次 ping 前检查 `alive`，若为 `false`（上次 pong 未到）则关闭连接
+- 每次 ping 后重置 `alive = false`，等 pong 回调设回 `true`
+- 连接移除时 `clearInterval(heartbeatTimer)` 清理定时器
+
+### 5. 在线状态广播
+
+用户上线/离线时自动通知同一会话的其他成员：
+
+```javascript
+// 连接建立时：首次连接广播上线
+const {socketId, wasFirstConnection} = await services.ws.create(socket, clientInfo);
+if (wasFirstConnection) {
+  await broadcastOnlineStatus(clientInfo.userId, true);
+}
+
+// 连接关闭时：全部端离线广播离线
+socket.on('close', async () => {
+  const result = await services.ws.remove(socketId);
+  if (result && result.isFullyOffline) {
+    await broadcastOnlineStatus(result.userId, false);
+  }
+});
+
+async function broadcastOnlineStatus(userId, isOnline) {
+  const eventType = isOnline ? 'userOnline' : 'userOffline';
+  const conversations = await services.conversation.getConversations(userId);
+  const notifiedUsers = new Set();
+  for (const conv of conversations) {
+    if (conv.members) {
+      for (const member of conv.members) {
+        const memberId = member.userId || member.id;
+        if (memberId !== userId && !notifiedUsers.has(memberId)) {
+          notifiedUsers.add(memberId);
+          await services.ws.sendToUser(memberId, eventType, {userId});
+        }
+      }
+    }
+  }
+}
+```
+
+**设计要点**：
+- 仅通知同一会话的其他成员，不做全量广播
+- 用 `Set` 去重避免用户在多个共同会话中被重复通知
+- 广播逻辑放在 Controller 层，避免 Service 层循环依赖
+```
+
+### 4. 事件驱动消息协议
+
+使用 `{type, payload}` 结构的消息协议，Controller 层做事件路由分发：
+
+```javascript
+socket.on('message', async raw => {
+  try {
+    const data = JSON.parse(raw);
+    await handleMessage(data, clientInfo);
+  } catch (e) {
+    socket.send(JSON.stringify({type: 'error', payload: {message: e.message}}));
+  }
+});
+
+async function handleMessage(data, clientInfo) {
+  const {type, payload} = data;
+  switch (type) {
+    case 'sendMessage':
+      await services.message.sendMessage({...payload, senderId: clientInfo.userId});
+      break;
+    case 'readMessages':
+      await services.message.readMessages(payload.conversationId, clientInfo.userId, payload.lastMessageId);
+      break;
+    // ... 更多事件
+    default:
+      services.ws.sendToUser(clientInfo.userId, 'error', {message: `Unknown event: ${type}`});
+  }
+}
+```
+
+### 5. 插件入口注册
+
+WebSocket 路由和连接池服务都通过 `@kne/fastify-namespace` 统一管理：
+
+```javascript
+const fp = require('fastify-plugin');
+const path = require('node:path');
+
+module.exports = fp(async (fastify, options) => {
+  options = Object.assign({}, {
+    dbTableNamePrefix: 't_',
+    name: 'im',
+    verifyToken: null,          // WebSocket Token 验证回调
+    sendNotification: null,     // 离线通知回调
+    offlineNotifyInterval: 24,
+    heartbeatInterval: 30000,   // 心跳间隔（毫秒）
+    connectionStore: null,      // 连接存储适配器（默认内存，可注入 Redis）
+    getAuthenticate: (type) => {  // 按功能分类返回认证中间件数组
+      const {authenticate} = fastify.account;
+      switch (type) {
+        case 'conversation:manage':
+          return [authenticate.user, authenticate.admin];
+        case 'conversation':
+        case 'conversation:create':
+        case 'conversation:leave':
+        case 'message':
+        case 'systemMessage':
+        default:
+          return [authenticate.user];
+      }
+    }
+  }, options);
+
+  fastify.register(require('@kne/fastify-namespace'), {
+    options,
+    name: options.name,
+    modules: [
+      ['controllers', path.resolve(__dirname, './libs/controllers')],
+      ['models', await fastify.sequelize.addModels(path.resolve(__dirname, './libs/models'), {
+        prefix: options.dbTableNamePrefix
+      })],
+      ['services', path.resolve(__dirname, './libs/services')]
+    ]
+  });
+});
+```
+
+## 回调注入模式
+
+对于插件无法内部实现的依赖（如发送邮件/短信、获取用户信息），通过 `options` 注入回调函数，由宿主应用提供实现：
+
+```javascript
+// 插件不关心通知渠道（邮件/短信/其他），只调用回调
+options = {
+  // 用户模型注入
+  getUserModel: () => fastify.account.models.user,
+
+  // WebSocket Token 解码
+  verifyToken: async (token) => {
+    return await fastify.shorten.services.shorten.decode(token);
+  },
+
+  // 离线通知（宿主应用内部决定发邮件/短信/其他）
+  sendNotification: async (userId, messageInfo, conversationInfo) => {
+    // 宿主应用自行决定通知渠道和内容
+    const user = await getUserInfo(userId);
+    if (user.email) await sendEmail(user.email, messageInfo);
+    if (user.phone) await sendSMS(user.phone, messageInfo);
+  },
+
+  // 连接存储注入（可选，默认内存，可替换为 Redis 支持多实例部署）
+  connectionStore: new RedisConnectionStore(redisClient),
+
+  // 权限验证注入（可选，按功能分类返回认证中间件数组，调用方精确控制每个功能模块的权限等级）
+  getAuthenticate: (type) => {
+    const {authenticate} = fastify.account;
+    switch (type) {
+      case 'conversation:create':
+        // 限制建群权限
+        return [authenticate.user, authenticate.admin];
+      case 'systemMessage':
+        // 系统消息只对特定角色可见
+        return [authenticate.user, customRoleAuthenticate('hr')];
+      default:
+        return [authenticate.user];
+    }
+  }
+};
+```
+
+**设计原则**：插件提供通用机制，具体实现由宿主应用注入，保持插件的通用性。
+
 ## 总结
 
 构建高质量的 Fastify 业务插件需要:
 
 1. **清晰的架构分层** - Controllers/Services/Models 职责分明
 2. **合理的配置管理** - 默认值 + 可覆盖 + 扩展点
-3. **健壮的认证机制** - 多层认证 + 上下文传递
+3. **健壮的认证机制** - 多层认证 + 上下文传递 + getAuthenticate 按功能分类权限
 4. **优雅的错误处理** - 语义化错误 + 统一响应
 5. **良好的扩展性** - 依赖注入 + 钩子函数 + 自定义实现
+6. **模型定义规范** - 不显式定义 id 和外键，camelCase 访问，JSONB 扩展
+7. **WebSocket 支持** - Token 认证 + 多端连接池 + 事件驱动协议 + 心跳保活 + 在线状态广播 + ConnectionStore 存储抽象
 
 遵循这些原则,可以构建出功能完整、易于维护、高度可扩展的业务插件系统。
