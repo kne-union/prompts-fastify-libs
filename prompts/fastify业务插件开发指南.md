@@ -6,10 +6,10 @@
 
 ## 核心架构设计
 
-### 1. 插件化架构
+### 1. 插件化架构[fastify业务插件开发指南.md](../../Github/fastify-message/prompts/prompts-fastify-libs/fastify%E4%B8%9A%E5%8A%A1%E6%8F%92%E4%BB%B6%E5%BC%80%E5%8F%91%E6%8C%87%E5%8D%97.md)
 
 使用 `fastify-plugin` 包装插件,确保作用域正确:
-
+[fastify业务插件开发指南.md](../../Github/fastify-message/prompts/prompts-fastify-libs/fastify%E4%B8%9A%E5%8A%A1%E6%8F%92%E4%BB%B6%E5%BC%80%E5%8F%91%E6%8C%87%E5%8D%97.md)
 ```javascript
 const fp = require('fastify-plugin');
 
