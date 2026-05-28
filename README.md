@@ -1,6 +1,6 @@
 # prompts-fastify-libs 文档索引
 
-本项目包含多个 Prompt 文档，用于辅助开发 `@kne/prompts-fastify-libs` 系列 Fastify 插件库，涵盖用户管理、即时通讯、数据库集成、多租户架构、短链接生成、消息发送、插件开发及测试编写等常用任务的 AI 提示词模板。
+本项目包含多个 Prompt 文档，用于辅助开发 `@kne/prompts-fastify-libs` 系列 Fastify 插件库，涵盖用户管理、即时通讯、消息发送、数据库集成、多租户架构、短链接生成、任务编排、数据统计、插件开发及测试编写等常用任务的 AI 提示词模板。
 
 ## 文档列表
 
@@ -130,7 +130,60 @@
 
 ---
 
-### 7. fastify-tenant使用指南
+### 7. fastify-statistics使用指南
+
+**功能**: 数据采集与多周期聚合统计插件，支持缓冲写入、时区查询和自动 Cron 聚合，提供完整的数据统计管道。
+
+**适用场景**: 
+- 需要数据采集和统计功能
+- 需要多周期数据聚合（时/日/周/月/季/年）
+- 需要多级数据通道和树形查询
+- 需要 SSE 实时数据推送
+- IoT 传感器数据或业务指标监控
+
+**核心内容**:
+- 多级数据通道（Channel）层级设计
+- 数据采集与自动展开
+- h/d/w/m/q/y 六种周期自动聚合
+- sum/avg/count/min/max 五种聚合方法
+- SSE 实时数据推送
+- 补偿聚合与水位线机制
+- 缓冲写入与查询缓存
+- 数据保留策略与自动清理
+
+**使用方式**: 阅读 [原文档](prompts/fastify-statistics使用指南.md) 了解详情
+
+---
+
+### 8. fastify-task使用指南
+
+**功能**: 任务编排与生命周期管理插件，支持系统自动执行和手动执行两种模式，提供任务创建、调度、追踪、重试、超时控制等完整功能。
+
+**适用场景**: 
+- 需要异步任务处理（导出、导入、发送等）
+- 需要定时任务调度
+- 需要任务执行追踪和进度查询
+- 需要任务状态统计看板
+- 需要父子任务依赖链
+
+**核心内容**:
+- 任务创建与生命周期管理
+- system/manual 双模式执行
+- Cron 定时调度系统任务
+- 任务脚本开发与 executor 辅助方法
+- 优先级排序与并发控制
+- 指数退避自动重试
+- 超时检测与自动标记
+- 父子任务依赖链
+- 异步回调支持（next → processNext）
+- HMAC-SHA256 签名验证
+- 统计面板与 SSE 实时推送
+
+**使用方式**: 阅读 [原文档](prompts/fastify-task使用指南.md) 了解详情
+
+---
+
+### 9. fastify-tenant使用指南
 
 **功能**: 多租户管理插件，提供租户管理、用户管理、组织架构、角色权限等功能。
 
@@ -152,7 +205,7 @@
 
 ---
 
-### 8. fastify业务插件开发指南
+### 10. fastify业务插件开发指南
 
 **功能**: 业务插件开发方法论指南，涵盖架构设计、分层组织、认证授权、WebSocket 开发等最佳实践。
 
@@ -178,7 +231,7 @@
 
 ---
 
-### 9. 单元测试编写指南
+### 11. 单元测试编写指南
 
 **功能**: 模块单元测试编写指南，总结通用的测试编写过程和最佳实践。
 
@@ -211,6 +264,8 @@
 | 模块化架构/插件组织 | fastify-namespace使用指南 |
 | 数据库操作/ORM | fastify-sequelize使用指南 |
 | 生成短链接/邀请码 | fastify-shorten使用指南 |
+| 数据采集与多周期统计 | fastify-statistics使用指南 |
+| 异步任务编排与调度 | fastify-task使用指南 |
 | 多租户/SaaS 应用 | fastify-tenant使用指南 |
 | 开发新的业务插件 | fastify业务插件开发指南 |
 | 编写单元测试 | 单元测试编写指南 |
@@ -228,6 +283,8 @@
 - [x] 即时通讯：[fastify-im使用指南](prompts/fastify-im使用指南.md)
 - [x] 消息发送：[fastify-message使用指南](prompts/fastify-message使用指南.md)
 - [x] 短链接：[fastify-shorten使用指南](prompts/fastify-shorten使用指南.md)
+- [x] 数据统计：[fastify-statistics使用指南](prompts/fastify-statistics使用指南.md)
+- [x] 任务编排：[fastify-task使用指南](prompts/fastify-task使用指南.md)
 - [x] 多租户：[fastify-tenant使用指南](prompts/fastify-tenant使用指南.md)
 
 ### 开发支持类
