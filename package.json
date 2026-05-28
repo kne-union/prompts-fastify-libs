@@ -1,6 +1,6 @@
 {
   "name": "@kne/prompts-fastify-libs",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Fastify 插件库开发辅助提示词集合，包含用户管理、消息发送、数据库集成、多租户架构、短链接生成、插件开发、单元测试等常用任务的 AI 提示词模板",
   "files": [
     "prompts"
