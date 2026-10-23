@@ -223,6 +223,7 @@
 - 多层认证中间件设计
 - Service 层设计规范
 - Controller 层路由约定
+- OpenAPI 文档规范（tags/summary/参数说明/响应 schema，补文档不改变行为）
 - 数据模型设计
 - WebSocket 插件开发模式
 - 回调注入模式
@@ -247,6 +248,7 @@
 - 测试覆盖维度
 - 断言最佳实践
 - Mock 与 Stub
+- OpenAPI 文档完整性测试
 - 资源清理
 - 测试覆盖率
 
