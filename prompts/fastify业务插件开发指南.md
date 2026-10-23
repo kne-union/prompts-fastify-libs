@@ -643,6 +643,132 @@ fastify.post('/create', {
 }, handler);
 ```
 
+### 4. OpenAPI 文档规范
+
+所有路由的 schema 必须能直接生成完整的 OpenAPI 文档。新写路由按本节编写；给已有路由补文档时，额外遵守下方「补文档不改变行为」。上文路由示例为简化写法，以本节为准。
+
+#### 4.1 必备字段
+
+| 位置 | 要求 |
+|------|------|
+| `tags` | 每个路由必填，按模块细分：`{包领域}-{模块}`，管理后台用 `{包领域}管理后台-{模块}`（如 `租户-组织架构`、`租户管理后台-权限`） |
+| `summary` | 每个路由必填，一句话说明接口 |
+| `description` | 有关键行为、副作用、权限限制、易误用点时必填（如「会同时删除子节点」「仅租户管理员可调用」） |
+| 请求参数 | `body` / `query` / `params` / `headers` 中**每个属性**都要有 `description`，包括嵌套对象属性、`oneOf` / `anyOf` 分支里的属性；代码实际读取的参数必须在 schema 中声明 |
+| 响应 | 每个路由声明 `response[200]`，带 `description`，描述实际返回结构 |
+
+- 无参数的路由不要写 `query: { type: 'object' }`：空对象会让 swagger 生成一个名为 `type` 的参数
+- 返回非 JSON（文件流、重定向、HTML、`reply.send(buffer)`）的路由不声明会干扰输出的 response schema，只在 `description` 中说明返回内容
+
+#### 4.2 响应 schema 写法
+
+响应 schema 会被 fast-json-stringify 用来序列化：**未声明字段会被丢弃**，非 nullable 的 `null` 会被强转（string 变 `""`、number 变 `0`），type 数组（如 `['string', 'null']`）遇到不匹配类型会直接 500。因此统一用 helper 编写，放在 `libs/schema/response.js`：
+
+```javascript
+// 响应 schema 只用于 OpenAPI 文档：字段可空、对象允许额外字段，避免序列化改变实际输出
+const str = description => ({ type: 'string', nullable: true, description });
+const num = description => ({ type: 'number', nullable: true, description });
+const bool = description => ({ type: 'boolean', nullable: true, description });
+// ID（BIGINT）与日期可能是 number / string / Date，不声明类型，原样输出
+const any = description => ({ description });
+const obj = (description, properties) => ({ type: 'object', nullable: true, additionalProperties: true, description, properties });
+
+const success = (description, schema) => ({ 200: Object.assign({}, schema || { type: 'object' }, { description }) });
+const empty = description => success(description || '操作成功，返回空对象');
+
+module.exports = { str, num, bool, any, obj, success, empty };
+```
+
+规则：
+
+- 标量字段一律 `{ type, nullable: true, description }`，不要用 type 数组
+- 对象（含嵌套对象）一律 `nullable: true` + `additionalProperties: true`
+- ID、外键（BIGINT 可能是 number 或 string）、日期、JSON 列、类型不确定的字段：只写 `description`，不写 `type`
+- 数组：`{ type: 'array', items: ..., description }`
+- 实体、分页列表等复用结构在 `response.js` 中定义一次，各路由引用
+
+```javascript
+const { str, num, any, obj, success, empty } = require('../schema/response');
+
+const resource = obj('资源', {
+  id: any('资源 ID'),
+  name: str('资源名称'),
+  status: num('状态：0 启用，1 停用'),
+  options: any('扩展配置（JSON）'),
+  createdAt: any('创建时间')
+});
+
+fastify.get(
+  `${options.prefix}/resource/list`,
+  {
+    onRequest: [authenticate.user, tenantAuthenticate.tenantUser],
+    schema: {
+      tags: ['租户-资源'],
+      summary: '资源列表',
+      description: '分页查询当前租户下的资源，按创建时间倒序',
+      query: {
+        type: 'object',
+        properties: {
+          filter: {
+            type: 'object',
+            description: '筛选条件',
+            properties: {
+              name: { type: 'string', description: '按名称模糊匹配' }
+            }
+          },
+          perPage: { type: 'number', description: '每页条数' },
+          currentPage: { type: 'number', description: '页码，从 1 开始' }
+        }
+      },
+      response: success('资源分页列表', {
+        type: 'object',
+        properties: {
+          pageData: { type: 'array', description: '当前页资源', items: resource },
+          totalCount: num('符合条件的总数')
+        }
+      })
+    }
+  },
+  async request => services.resource.list(request.tenantUserInfo, request.query)
+);
+
+fastify.post(
+  `${options.prefix}/resource/remove`,
+  {
+    onRequest: [authenticate.user, tenantAuthenticate.tenantUser],
+    schema: {
+      tags: ['租户-资源'],
+      summary: '删除资源',
+      body: {
+        type: 'object',
+        required: ['id'],
+        properties: { id: { type: 'string', description: '资源 ID' } }
+      },
+      response: empty()
+    }
+  },
+  async request => {
+    await services.resource.remove(request.tenantUserInfo, request.body);
+    return {};
+  }
+);
+```
+
+#### 4.3 补文档不改变行为
+
+给已有接口补 schema 时，只补文档，**不得改变接口实际输入输出**：
+
+- 已有的 response schema 保持类型与结构不动，只补 `description`（改结构会改变序列化结果）
+- 请求 schema 不新增 `required`、`enum`、`minimum`、`format` 等约束，避免原本合法的请求变 400；需要收紧的校验单独提出，不在补文档时顺手改
+- 不加 `default`：ajv `useDefaults` 会注入默认值。尤其编辑接口复用创建接口的 schema 时，未传字段会被默认值覆盖，导致数据被清空
+- 不给原本无类型约束的字段加会触发强转的 `type`
+- 补完后用 `fastify.inject` 对改动前后的响应拍快照（归一化 id / 时间 / token，比较时忽略键顺序），确认响应值一致
+- 补文档过程中发现的 bug 单独记录、单独修，不混进文档改动
+
+#### 4.4 文档完整性测试
+
+有测试的仓库加一条测试，遍历所有路由检查 `tags`、`summary`、`response[200].description` 与参数 `description`，防止后续新增路由漏写，写法见《单元测试编写指南》「4.8 OpenAPI 文档完整性测试」。
+
 ## 数据模型设计
 
 ### 1. 关联关系定义
